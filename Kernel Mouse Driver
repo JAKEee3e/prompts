@@ -1,0 +1,1270 @@
+# Stealth Kernel Mouse Driver Architecture — Complete Build Prompt
+
+> **Purpose**: This prompt contains everything needed to recreate the stealth kernel-mode mouse driver from scratch. It covers mouse injection via ServiceCallback, physical memory reading, return address spoofing, PTE hooking on dxgkrnl.sys, and comprehensive trace cleaning. All patterns, byte sequences, structures, and design decisions are documented.
+
+---
+
+## 1. Project Overview
+
+**Type**: External kernel-mode driver for Mouse Injection + Physical Memory Read  
+**Loader**: kdmapper (Intel iqvw64e.sys vulnerable driver)  
+**Anti-cheat target**: EAC (Easy Anti-Cheat) / BE (BattlEye)  
+**OS**: Windows 10/11 x64 (22H2+)  
+**Constraints**: **NO WINDOWS API AT ALL** for mouse input (use ServiceCallback). Avoid standard APIs like `SendInput`.
+
+### Architecture Flow
+
+```
+kdmapper loads driver.sys → DriverEntry()
+  → Hook::Install() — PTE hook on dxgkrnl.sys (Physical Execution Redirection)
+  → SetupMouse() — Locate MouseClassServiceCallback
+  → CleanAllTraces() — PiDDB, MmUnloadedDrivers, Wipe Headers, Unlink System List
+  → Driver is now invisible, communicates via hooked dxgkrnl function
+
+Usermode client:
+  → LoadLibrary("win32u.dll")
+  → GetProcAddress("NtQueryCompositionSurfaceStatistics")
+  → Call with REQUEST_DATA struct (magic = 0x4D4F5553 "MOUS")
+  → Hooked function dispatches to our mouse handler
+```
+
+---
+
+## 2. File Structure
+
+```
+driver/
+├── driver.cpp          — DriverEntry, calls Hook::Install, SetupMouse, then CleanAllTraces
+├── driver.h            — Includes definitions.h + mouse.h
+├── definitions.h       — Kernel imports, Mouse structures, undocumented APIs
+├── shared.h            — REQUEST_DATA struct + command IDs (shared with usermode)
+├── hook.h              — Hook::Install / Hook::Handler prototypes
+├── hook.cpp            — PTE hook installation + command dispatcher
+├── pte_hook.h          — PTE-based hook engine (MiGetPteAddress, page remapping)
+├── mouse.h             — Mouse callback structures and prototypes
+├── mouse.cpp           — MouseClassServiceCallback location & injection logic
+├── spoof_call.h        — Return address spoofing via ntoskrnl gadget
+└── cleaner.h           — PiDDB, MmUnloadedDrivers, DriverObject cleaning
+```
+
+---
+
+## 3. Communication Protocol (`shared.h`)
+
+This header is included by BOTH kernel and usermode. It defines the communication protocol.
+
+### Command IDs
+
+```cpp
+typedef enum _DRIVER_COMMAND {
+    CMD_NONE          = 0,
+    CMD_MOUSE_MOVE    = 1,    // Inject mouse movement
+    CMD_MOUSE_BUTTON  = 2,    // Inject mouse button press/release
+    CMD_UNLOAD        = 98,   // Trigger driver unload
+    CMD_PING          = 99,   // Connection check
+    CMD_VERIFY_PTE    = 100,  // Debug: return PTE hook state
+    CMD_VERIFY_MOUSE  = 101,  // Debug: return mouse callback state
+} DRIVER_COMMAND;
+```
+
+### Request Structure
+
+```cpp
+#define REQUEST_MAGIC 0x4D4F5553  // "MOUS"
+
+typedef struct _MOUSE_DATA {
+    LONG x;
+    LONG y;
+    USHORT buttonFlags;
+    USHORT buttonData;
+} MOUSE_DATA;
+
+typedef struct _REQUEST_DATA {
+    unsigned int    magic;           // Must be REQUEST_MAGIC
+    unsigned int    command;         // DRIVER_COMMAND enum
+    unsigned __int64 buffer;        // Usermode buffer for debug output
+    unsigned __int64 size;          // Buffer size
+    MOUSE_DATA      mouseData;      // For CMD_MOUSE_MOVE / CMD_MOUSE_BUTTON
+    unsigned __int64 result;        // Output: success/failure code
+} REQUEST_DATA, *PREQUEST_DATA;
+```
+
+**Key design**: The `magic` field distinguishes our calls from legitimate dxgkrnl calls. If `magic != REQUEST_MAGIC`, the handler returns `STATUS_SUCCESS` immediately (pass-through to original).
+
+---
+
+## 4. Driver Entry (`driver.cpp`)
+
+```cpp
+extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+{
+    UNREFERENCED_PARAMETER(RegistryPath);
+
+    // 1. Install dxgkrnl hook for communication
+    if (!Hook::Install(&Hook::Handler))
+        return STATUS_UNSUCCESSFUL;
+
+    // 2. Locate and setup mouse service callback
+    if (!SetupMouseCallback())
+        return STATUS_UNSUCCESSFUL;
+
+    // 3. Clean ALL traces and hide driver
+    CleanAllTraces(DriverObject);
+
+    return STATUS_SUCCESS;
+}
+```
+
+**Order matters**: 
+1. Hook first (needs dxgkrnl export resolution)
+2. Mouse setup (needs to find MouseClassServiceCallback)
+3. Clean last (removes our own traces from PiDDB, MmUnloadedDrivers, erases PE headers, NULLs DriverObject)
+
+---
+
+## 5. Mouse Injection Mechanism (`mouse.cpp`)
+
+To avoid `SendInput` and `mouse_event` (which are monitored by anti-cheat), we inject directly into the Mouse Class Service Callback.
+
+### 5.1 Locating the Service Callback
+
+The Mouse Class driver (`MouClass.sys` or similar filters) registers a callback to receive input from the port driver (`i8042prt.sys` / `mouhid.sys`). We must locate this pointer.
+
+**Method 1: Device Stack Walk**
+
+```cpp
+NTSTATUS FindMouseServiceCallback()
+{
+    UNICODE_STRING deviceName;
+    RtlInitUnicodeString(&deviceName, L"\\Device\\PointerClass0");
+    
+    PFILE_OBJECT fileObject = NULL;
+    PDEVICE_OBJECT deviceObject = NULL;
+    
+    // Get the device object
+    NTSTATUS status = IoGetDeviceObjectPointer(&deviceName, FILE_READ_DATA, &fileObject, &deviceObject);
+    if (!NT_SUCCESS(status))
+        return status;
+    
+    // Walk up the device stack to find the port driver
+    PDEVICE_OBJECT lowerDevice = IoGetAttachedDeviceReference(deviceObject);
+    
+    ObfDereferenceObject(fileObject);
+    
+    // The CONNECT_DATA structure is stored in the device extension
+    // of the port driver (mouhid.sys or i8042prt.sys)
+    // Structure offset varies by driver version, typically at +0x10 to +0x30
+    
+    for (ULONG offset = 0x10; offset < 0x100; offset += 0x8)
+    {
+        PVOID* potentialCallback = (PVOID*)((ULONG_PTR)lowerDevice->DeviceExtension + offset);
+        
+        // Validate the pointer
+        if (MmIsAddressValid(potentialCallback) && 
+            MmIsAddressValid(*potentialCallback))
+        {
+            // Check if it points to MouClass driver range
+            PVOID callbackPtr = *potentialCallback;
+            
+            // Additional validation: check if function prologue looks valid
+            BYTE* fnBytes = (BYTE*)callbackPtr;
+            if (MmIsAddressValid(fnBytes) &&
+                (fnBytes[0] == 0x48 || fnBytes[0] == 0x40 || fnBytes[0] == 0x4C))
+            {
+                g_MouseServiceCallback = (MOUSE_SERVICE_CALLBACK)callbackPtr;
+                g_MouseDeviceObject = lowerDevice;
+                return STATUS_SUCCESS;
+            }
+        }
+    }
+    
+    ObfDereferenceObject(lowerDevice);
+    return STATUS_NOT_FOUND;
+}
+```
+
+**Method 2: Pattern Scanning (More Reliable)**
+
+Scan the `MouClass.sys` driver for the service callback registration code:
+
+```cpp
+// Pattern for MouseClassServiceCallback function (first few bytes)
+// Typical prologue: 48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC ??
+BYTE mouseCallbackPattern[] = {
+    0x48, 0x89, 0x5C, 0x24, 0xFF,  // mov [rsp+??], rbx
+    0x48, 0x89, 0x74, 0x24, 0xFF,  // mov [rsp+??], rsi
+    0x57,                           // push rdi
+    0x48, 0x83, 0xEC, 0xFF          // sub rsp, ??
+};
+const char mouseMask[] = "xxxx?xxxx?xxxx?";
+
+PVOID FindPatternInModule(PVOID baseAddress, SIZE_T size, BYTE* pattern, const char* mask)
+{
+    SIZE_T patternLen = strlen(mask);
+    
+    for (SIZE_T i = 0; i < size - patternLen; i++)
+    {
+        BOOLEAN found = TRUE;
+        for (SIZE_T j = 0; j < patternLen; j++)
+        {
+            if (mask[j] != '?' && ((BYTE*)baseAddress)[i + j] != pattern[j])
+            {
+                found = FALSE;
+                break;
+            }
+        }
+        if (found)
+            return (PVOID)((ULONG_PTR)baseAddress + i);
+    }
+    return NULL;
+}
+```
+
+### 5.2 Mouse Input Data Structure
+
+```cpp
+// MOUSE_INPUT_DATA structure (ntddmou.h)
+typedef struct _MOUSE_INPUT_DATA {
+    USHORT UnitId;              // Mouse device unit number
+    USHORT Flags;               // MOUSE_MOVE_RELATIVE (0) or MOUSE_MOVE_ABSOLUTE (1)
+    union {
+        ULONG Buttons;          // Raw button state
+        struct {
+            USHORT ButtonFlags; // MOUSE_LEFT_BUTTON_DOWN, etc.
+            USHORT ButtonData;  // Wheel delta for MOUSE_WHEEL
+        };
+    };
+    ULONG RawButtons;           // Device-specific raw button data
+    LONG LastX;                 // Signed relative or absolute motion
+    LONG LastY;                 // Signed relative or absolute motion
+    ULONG ExtraInformation;     // Device-specific extra data
+} MOUSE_INPUT_DATA, *PMOUSE_INPUT_DATA;
+
+// Button flags
+#define MOUSE_LEFT_BUTTON_DOWN   0x0001
+#define MOUSE_LEFT_BUTTON_UP     0x0002
+#define MOUSE_RIGHT_BUTTON_DOWN  0x0004
+#define MOUSE_RIGHT_BUTTON_UP    0x0008
+#define MOUSE_MIDDLE_BUTTON_DOWN 0x0010
+#define MOUSE_MIDDLE_BUTTON_UP   0x0020
+#define MOUSE_BUTTON_4_DOWN      0x0040
+#define MOUSE_BUTTON_4_UP        0x0080
+#define MOUSE_BUTTON_5_DOWN      0x0100
+#define MOUSE_BUTTON_5_UP        0x0200
+#define MOUSE_WHEEL              0x0400
+
+// Movement flags
+#define MOUSE_MOVE_RELATIVE      0x0000
+#define MOUSE_MOVE_ABSOLUTE      0x0001
+#define MOUSE_VIRTUAL_DESKTOP    0x0002
+#define MOUSE_ATTRIBUTES_CHANGED 0x0004
+#define MOUSE_MOVE_NOCOALESCE    0x0008
+```
+
+### 5.3 Service Callback Type
+
+```cpp
+// Definition of the MouseClassServiceCallback
+typedef VOID (*MOUSE_SERVICE_CALLBACK)(
+    PDEVICE_OBJECT DeviceObject,    // Mouse class device object
+    PMOUSE_INPUT_DATA InputDataStart, // Start of input data array
+    PMOUSE_INPUT_DATA InputDataEnd,   // End of input data array
+    PULONG InputDataConsumed          // Output: number of input packets consumed
+);
+```
+
+### 5.4 Injection Functions
+
+```cpp
+// Global state
+MOUSE_SERVICE_CALLBACK g_MouseServiceCallback = NULL;
+PDEVICE_OBJECT g_MouseDeviceObject = NULL;
+
+// Inject relative mouse movement
+NTSTATUS InjectMouseMove(LONG x, LONG y)
+{
+    if (!g_MouseServiceCallback || !g_MouseDeviceObject)
+        return STATUS_UNSUCCESSFUL;
+    
+    MOUSE_INPUT_DATA data = {0};
+    data.UnitId = 0;
+    data.Flags = MOUSE_MOVE_RELATIVE;
+    data.LastX = x;  // Relative pixels
+    data.LastY = y;  // Relative pixels
+    data.ButtonFlags = 0;
+    data.ButtonData = 0;
+    
+    ULONG consumed = 0;
+    
+    // Call the original service callback with address spoofing
+    if (g_SpoofStub)
+        SpoofCall4(g_MouseServiceCallback, g_MouseDeviceObject, &data, &data + 1, &consumed);
+    else
+        g_MouseServiceCallback(g_MouseDeviceObject, &data, &data + 1, &consumed);
+    
+    return consumed > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+// Inject mouse button press/release
+NTSTATUS InjectMouseButton(USHORT buttonFlags, USHORT buttonData)
+{
+    if (!g_MouseServiceCallback || !g_MouseDeviceObject)
+        return STATUS_UNSUCCESSFUL;
+    
+    MOUSE_INPUT_DATA data = {0};
+    data.UnitId = 0;
+    data.Flags = MOUSE_MOVE_RELATIVE;
+    data.LastX = 0;
+    data.LastY = 0;
+    data.ButtonFlags = buttonFlags;
+    data.ButtonData = buttonData;  // Used for wheel delta
+    
+    ULONG consumed = 0;
+    
+    if (g_SpoofStub)
+        SpoofCall4(g_MouseServiceCallback, g_MouseDeviceObject, &data, &data + 1, &consumed);
+    else
+        g_MouseServiceCallback(g_MouseDeviceObject, &data, &data + 1, &consumed);
+    
+    return consumed > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+```
+
+> **Note on Movement**: 
+> - **Relative Mode** (default): `x=10, y=0` moves cursor 10 pixels right from current position
+> - **Absolute Mode**: Coordinates are in range [0, 65535] mapped to screen dimensions
+> - **Multiple Packets**: Can batch multiple `MOUSE_INPUT_DATA` entries for smooth movement
+
+---
+
+## 6. Stealth Communication: PTE Hook (`pte_hook.h`)
+
+We route communication through `dxgkrnl.sys` by modifying Page Table Entries (PTEs).
+
+### 6.1 Hook Target
+
+**Function**: `NtQueryCompositionSurfaceStatistics`  
+**Module**: `dxgkrnl.sys`  
+**Why**: This function is exported by dxgkrnl and callable from usermode via `win32u.dll`. It takes a single `PVOID` parameter — perfect for passing our `REQUEST_DATA` struct.
+
+### 6.2 Hook Installation — PTE Method (Primary)
+
+The PTE hook is the **stealth** method. It remaps the virtual-to-physical mapping so:
+- The **original physical page** stays clean (what EAC integrity checks read)
+- A **copy of the page** with our trampoline is what the CPU actually executes
+
+**Step-by-step**:
+
+1. **Find `MiGetPteAddress`** in ntoskrnl via pattern scan:
+   ```
+   Pattern (31 bytes):
+   48 C1 E9 09              shr rcx, 9
+   48 B8 [8 bytes MASK]     mov rax, <MASK>
+   48 23 C8                 and rcx, rax
+   48 B8 [8 bytes PTE_BASE] mov rax, <PTE_BASE>
+   48 03 C1                 add rax, rcx
+   C3                       ret
+   ```
+   This gives us reliable PTE resolution without hardcoding PTE_BASE.
+
+2. **Check PDE for large page**: If the target is on a 2MB large page, split it into 512 × 4KB pages first:
+   - Allocate contiguous page for new page table entries
+   - Fill 512 PTEs pointing to consecutive 4KB frames of the original 2MB page
+   - Atomically swap PDE to point to new page table (clear LargePage bit)
+   - Invalidate TLB for all 512 pages
+
+3. **Allocate new physical page**: `MmAllocateContiguousMemorySpecifyCache`
+
+4. **Copy original page**: Map original physical page via `MmMapIoSpace`, `RtlCopyMemory` to new page
+
+5. **Apply trampoline** at the hook offset within the copy:
+   ```asm
+   48 B8 [8-byte handler addr]    mov rax, <handlerAddr>
+   FF E0                          jmp rax
+   ```
+
+6. **Swap PFN in PTE**: Atomically change `pte->PageFrameNumber` to point to our new page using `InterlockedExchange64`, then `__invlpg` to flush TLB.
+
+### 6.3 Hook Installation — Inline Patch (Fallback)
+
+If PTE hook fails (unusual Windows version, PTE pattern not found), falls back to direct code patching:
+
+```cpp
+BYTE patch[12] = { 0 };
+patch[0] = 0x48;  // REX.W
+patch[1] = 0xB8;  // MOV RAX, imm64
+memcpy(&patch[2], &handlerAddr, 8);
+patch[10] = 0xFF; // JMP RAX
+patch[11] = 0xE0;
+WriteReadOnlyMemory(hookTarget, patch, 12);
+```
+
+Uses MDL-based write: `IoAllocateMdl` → `MmProbeAndLockPages` → `MmMapLockedPagesSpecifyCache` → `MmProtectMdlSystemAddress(PAGE_READWRITE)` → `memcpy`.
+
+### 6.4 PTE Hook State
+
+```cpp
+typedef struct _PTE_ENTRY {
+    ULONG64 Present : 1;          // Page is present in memory
+    ULONG64 Write : 1;            // Page is writable
+    ULONG64 User : 1;             // User-mode accessible
+    ULONG64 WriteThrough : 1;     // Write-through caching
+    ULONG64 CacheDisable : 1;     // Caching disabled
+    ULONG64 Accessed : 1;         // Page has been accessed
+    ULONG64 Dirty : 1;            // Page has been written to
+    ULONG64 LargePage : 1;        // Large page (2MB/1GB)
+    ULONG64 Global : 1;           // Global page
+    ULONG64 CopyOnWrite : 1;      // Software: copy-on-write
+    ULONG64 Prototype : 1;        // Software: prototype PTE
+    ULONG64 Reserved : 1;         // Software: reserved
+    ULONG64 PageFrameNumber : 36; // Physical frame number
+    ULONG64 ReservedHigh : 4;     // Reserved
+    ULONG64 SoftwareWsIndex : 11; // Software: working set index
+    ULONG64 NoExecute : 1;        // No execute
+} PTE_ENTRY, *PPTE_ENTRY;
+
+typedef struct _PTE_HOOK_STATE {
+    PVOID       targetVA;       // Hooked virtual address
+    PPTE_ENTRY  pteAddress;     // Pointer to the PTE
+    ULONG64     originalPfn;    // Original physical frame number
+    ULONG64     newPfn;         // Our page's physical frame number
+    PVOID       newPageVA;      // Virtual address of our allocated page
+    PHYSICAL_ADDRESS newPagePA; // Physical address of our page
+    BOOLEAN     active;         // Is hook active?
+    BYTE        originalBytes[12]; // Original function bytes (for unhooking)
+} PTE_HOOK_STATE;
+
+PTE_HOOK_STATE g_HookState = {0};
+```
+
+### 6.5 Command Dispatcher (`Hook::Handler`)
+
+The handler checks `magic == REQUEST_MAGIC`, then switches on `command`:
+
+```cpp
+NTSTATUS Hook::Handler(PREQUEST_DATA request)
+{
+    // Validate magic
+    if (!request || request->magic != REQUEST_MAGIC)
+        return STATUS_SUCCESS; // Pass-through to original function
+    
+    __try {
+        switch (request->command)
+        {
+            case CMD_MOUSE_MOVE:
+                request->result = InjectMouseMove(
+                    request->mouseData.x,
+                    request->mouseData.y
+                );
+                break;
+            
+            case CMD_MOUSE_BUTTON:
+                request->result = InjectMouseButton(
+                    request->mouseData.buttonFlags,
+                    request->mouseData.buttonData
+                );
+                break;
+            
+            case CMD_PING:
+                // Return signature based on hook type
+                request->result = g_HookState.active ? 0x4D4F5553 : 0x4D535046;
+                break;
+            
+            case CMD_VERIFY_PTE:
+                // Debug: copy PTE state to usermode buffer
+                if (request->buffer && request->size >= sizeof(PTE_HOOK_STATE))
+                {
+                    RtlCopyMemory((PVOID)request->buffer, &g_HookState, sizeof(PTE_HOOK_STATE));
+                    request->result = STATUS_SUCCESS;
+                }
+                break;
+            
+            case CMD_VERIFY_MOUSE:
+                // Debug: return mouse callback state
+                request->result = (ULONG64)g_MouseServiceCallback;
+                break;
+            
+            default:
+                request->result = STATUS_INVALID_PARAMETER;
+                break;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        request->result = STATUS_ACCESS_VIOLATION;
+    }
+    
+    return STATUS_SUCCESS;
+}
+```
+
+| Command | Handler | Return Value |
+|---------|---------|--------------|
+| `CMD_MOUSE_MOVE` | `InjectMouseMove()` | STATUS_SUCCESS or error |
+| `CMD_MOUSE_BUTTON` | `InjectMouseButton()` | STATUS_SUCCESS or error |
+| `CMD_UNLOAD` | `UnloadWorker()` (deferred) | STATUS_SUCCESS if work item queued |
+| `CMD_PING` | Connection test | `0x4D4F5553` if PTE hook active |
+| `CMD_VERIFY_PTE` | Debug: PTE state | Full PTE_HOOK_STATE structure |
+| `CMD_VERIFY_MOUSE` | Debug: Mouse callback | Address of service callback |
+
+---
+
+## 7. Return Address Spoofing (`spoof_call.h`)
+
+### 7.1 Problem
+
+When our manually-mapped driver calls kernel APIs (e.g., `IoGetDeviceObjectPointer`, `MouseServiceCallback`), the return address on the stack points to our code — which is in unmapped/non-module memory. EAC stack walks detect this.
+
+### 7.2 Solution
+
+Route calls through a gadget in `ntoskrnl.exe` so the callee sees a return address inside a legitimate module.
+
+### 7.3 Gadget
+
+```
+Pattern: 48 83 C4 28 C3
+  add rsp, 0x28
+  ret
+```
+
+This is a very common function epilogue in ntoskrnl. Found by scanning executable sections.
+
+### 7.4 Shellcode Stub (52 bytes)
+
+Called as: `stub(targetFn, arg1, arg2, arg3, arg4)`
+
+```asm
+41 5B                 pop r11              ; save real return address
+48 8B C1              mov rax, rcx         ; rax = target function
+48 8B CA              mov rcx, rdx         ; shift arg1 → rcx
+49 8B D0              mov rdx, r8          ; shift arg2 → rdx
+4D 8B C1              mov r8, r9           ; shift arg3 → r8
+4C 8B 4C 24 20        mov r9, [rsp+0x20]   ; shift arg4 → r9
+48 83 EC 38           sub rsp, 0x38        ; allocate shadow space + frame
+49 BA [8-byte gadget] mov r10, <gadget>    ; load gadget address
+4C 89 14 24           mov [rsp], r10       ; [rsp] = gadget (fake return addr)
+4C 89 5C 24 30        mov [rsp+0x30], r11  ; [rsp+0x30] = real return
+FF E0                 jmp rax              ; jump to target
+```
+
+**Flow**: Target returns to gadget → `add rsp, 0x28; ret` → pops real return address → back to our code.
+
+### 7.5 Typed Wrappers
+
+```cpp
+typedef NTSTATUS (*fn_spoof_1)(PVOID fn, PVOID a1);
+typedef NTSTATUS (*fn_spoof_2)(PVOID fn, PVOID a1, PVOID a2);
+typedef NTSTATUS (*fn_spoof_3)(PVOID fn, PVOID a1, PVOID a2, PVOID a3);
+typedef NTSTATUS (*fn_spoof_4)(PVOID fn, PVOID a1, PVOID a2, PVOID a3, PVOID a4);
+
+#define SpoofCall1(fn, a1)           ((fn_spoof_1)g_SpoofStub)((PVOID)(fn), (PVOID)(a1))
+#define SpoofCall2(fn, a1, a2)       ((fn_spoof_2)g_SpoofStub)((PVOID)(fn), (PVOID)(a1), (PVOID)(a2))
+#define SpoofCall3(fn, a1, a2, a3)   ((fn_spoof_3)g_SpoofStub)((PVOID)(fn), (PVOID)(a1), (PVOID)(a2), (PVOID)(a3))
+#define SpoofCall4(fn, a1, a2, a3, a4) ((fn_spoof_4)g_SpoofStub)((PVOID)(fn), (PVOID)(a1), (PVOID)(a2), (PVOID)(a3), (PVOID)(a4))
+```
+
+**Usage pattern** (throughout the driver):
+```cpp
+if (g_SpoofStub)
+    SpoofCall2(IoGetDeviceObjectPointer, &deviceName, FILE_READ_DATA, &fileObject, &deviceObject);
+else
+    IoGetDeviceObjectPointer(&deviceName, FILE_READ_DATA, &fileObject, &deviceObject);
+```
+
+### 7.6 Init
+
+```cpp
+PVOID g_SpoofStub = NULL;
+PVOID g_SpoofGadget = NULL;
+
+NTSTATUS InitSpoofCall()
+{
+    // 1. Find the gadget in ntoskrnl
+    g_SpoofGadget = FindSpoofGadget();
+    if (!g_SpoofGadget)
+        return STATUS_NOT_FOUND;
+    
+    // 2. Allocate executable memory for stub
+    g_SpoofStub = ExAllocatePoolWithTag(NonPagedPoolExecute, 64, 'fpSM');
+    if (!g_SpoofStub)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    
+    // 3. Copy shellcode and patch gadget address
+    BYTE shellcode[52] = {
+        0x41, 0x5B,                         // pop r11
+        0x48, 0x8B, 0xC1,                   // mov rax, rcx
+        0x48, 0x8B, 0xCA,                   // mov rcx, rdx
+        0x49, 0x8B, 0xD0,                   // mov rdx, r8
+        0x4D, 0x8B, 0xC1,                   // mov r8, r9
+        0x4C, 0x8B, 0x4C, 0x24, 0x20,       // mov r9, [rsp+0x20]
+        0x48, 0x83, 0xEC, 0x38,             // sub rsp, 0x38
+        0x49, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // mov r10, <gadget>
+        0x4C, 0x89, 0x14, 0x24,             // mov [rsp], r10
+        0x4C, 0x89, 0x5C, 0x24, 0x30,       // mov [rsp+0x30], r11
+        0xFF, 0xE0                          // jmp rax
+    };
+    
+    // Patch gadget address at offset 25
+    *(PVOID*)(&shellcode[25]) = g_SpoofGadget;
+    
+    RtlCopyMemory(g_SpoofStub, shellcode, sizeof(shellcode));
+    
+    return STATUS_SUCCESS;
+}
+```
+
+---
+
+## 8. Trace Cleaning (`cleaner.h`)
+
+### 8.1 PiDDB Cache Table
+
+The PiDDB (Plug and Play Database) caches information about every driver ever loaded. EAC checks this.
+
+**Locate PiDDB**:
+```
+PiDDBLockPtr pattern:  48 8D 0D CC CC CC CC E8 CC CC CC CC 48 8B 0D CC CC CC CC 33 DB
+PiDTablePtr pattern:   48 8D 0D CC CC CC CC E8 CC CC CC CC 3D CC CC CC CC 0F 83 CC CC CC CC
+```
+
+Both scanned in ntoskrnl's `PAGE` section. Results are RVAs — add `g_KernelBase` then resolve RIP-relative address.
+
+**Clean**:
+```cpp
+NTSTATUS CleanPiDDBCacheTable()
+{
+    // Locate PiDDB structures via pattern scan
+    PVOID PiDDBLock = FindPiDDBLock();
+    PVOID PiDDBCacheTable = FindPiDDBCacheTable();
+    
+    if (!PiDDBLock || !PiDDBCacheTable)
+        return STATUS_NOT_FOUND;
+    
+    // Prepare lookup entry
+    PIDCacheobj lookupEntry = {0};
+    RtlInitUnicodeString(&lookupEntry.DriverName, L"iqvw64e.sys");
+    lookupEntry.TimeDateStamp = 0x5284EAC3; // Intel driver timestamp
+    
+    // Acquire lock
+    ExAcquireResourceExclusiveLite((PERESOURCE)PiDDBLock, TRUE);
+    
+    // Find entry
+    PIDCacheobj* pFound = (PIDCacheobj*)RtlLookupElementGenericTableAvl(
+        (PRTL_AVL_TABLE)PiDDBCacheTable,
+        &lookupEntry
+    );
+    
+    if (pFound)
+    {
+        // Remove from list
+        RemoveEntryList(&pFound->List);
+        
+        // Delete from AVL tree
+        RtlDeleteElementGenericTableAvl((PRTL_AVL_TABLE)PiDDBCacheTable, pFound);
+    }
+    
+    ExReleaseResourceLite((PERESOURCE)PiDDBLock);
+    
+    return pFound ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+}
+```
+
+### 8.2 MmUnloadedDrivers
+
+```
+Pattern: 4C 8B CC CC CC CC CC 4C 8B C9 4D 85 CC 74
+```
+
+Scanned in ntoskrnl `PAGE` section. Resolves to `MmUnloadedDrivers` and `MmLastUnloadedDriver`.
+
+**Clean**: 
+```cpp
+NTSTATUS CleanMmUnloadedDrivers()
+{
+    PVOID MmUnloadedDrivers = FindMmUnloadedDrivers();
+    
+    if (!MmUnloadedDrivers)
+        return STATUS_NOT_FOUND;
+    
+    PMM_UNLOADED_DRIVER entry = (PMM_UNLOADED_DRIVER)MmUnloadedDrivers;
+    
+    // Iterate up to 50 entries
+    for (ULONG i = 0; i < 50; i++)
+    {
+        if (entry[i].Name.Buffer)
+        {
+            // Check for iqvw64e or Iqvw64e
+            if (wcsstr(entry[i].Name.Buffer, L"iqvw64e") ||
+                wcsstr(entry[i].Name.Buffer, L"Iqvw64e"))
+            {
+                // Zero out the entry
+                RtlZeroMemory(&entry[i], sizeof(MM_UNLOADED_DRIVER));
+                break;
+            }
+        }
+    }
+    
+    return STATUS_SUCCESS;
+}
+```
+
+### 8.3 Driver Object Hiding
+
+```cpp
+NTSTATUS HideDriverObject(PDRIVER_OBJECT DriverObject)
+{
+    // 1. Clear driver name
+    if (DriverObject->DriverName.Buffer)
+    {
+        RtlZeroMemory(DriverObject->DriverName.Buffer, DriverObject->DriverName.Length);
+        DriverObject->DriverName.Length = 0;
+        DriverObject->DriverName.MaximumLength = 0;
+    }
+    
+    // 2. Unlink from PsLoadedModuleList
+    if (DriverObject->DriverSection)
+    {
+        PLDR_DATA_TABLE_ENTRY ldrEntry = (PLDR_DATA_TABLE_ENTRY)DriverObject->DriverSection;
+        
+        // Unlink from load order list
+        PLIST_ENTRY prevEntry = ldrEntry->InLoadOrderModuleList.Blink;
+        PLIST_ENTRY nextEntry = ldrEntry->InLoadOrderModuleList.Flink;
+        
+        prevEntry->Flink = nextEntry;
+        nextEntry->Blink = prevEntry;
+    }
+    
+    // 3. Erase PE headers
+    if (DriverObject->DriverStart)
+    {
+        PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)DriverObject->DriverStart;
+        if (dosHeader->e_magic == IMAGE_DOS_SIGNATURE)
+        {
+            PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)((ULONG_PTR)DriverObject->DriverStart + dosHeader->e_lfanew);
+            if (ntHeaders->Signature == IMAGE_NT_SIGNATURE)
+            {
+                ULONG headerSize = ntHeaders->OptionalHeader.SizeOfHeaders;
+                RtlZeroMemory(DriverObject->DriverStart, headerSize);
+            }
+        }
+    }
+    
+    // 4. NULL out critical fields
+    DriverObject->DriverSection = NULL;
+    DriverObject->DriverInit = NULL;
+    DriverObject->DriverStart = NULL;
+    DriverObject->DriverSize = 0;
+    
+    // 5. NULL all IRP handlers
+    for (ULONG i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
+        DriverObject->MajorFunction[i] = NULL;
+    
+    return STATUS_SUCCESS;
+}
+```
+
+### 8.4 Master Clean Call
+
+```cpp
+NTSTATUS CleanAllTraces(PDRIVER_OBJECT DriverObject)
+{
+    // 1. Clean PiDDB Cache
+    CleanPiDDBCacheTable();
+    
+    // 2. Clean MmUnloadedDrivers (non-fatal if fails)
+    CleanMmUnloadedDrivers();
+    
+    // 3. Hide driver object completely
+    HideDriverObject(DriverObject);
+    
+    return STATUS_SUCCESS;
+}
+```
+
+---
+
+## 9. Driver Unload Capability
+
+### 9.1 Overview
+
+Unlike the basic implementation, this driver **can be safely unloaded** at runtime. This is critical for:
+- Testing and development
+- Avoiding system restarts during debugging
+- Proper resource cleanup
+- Preventing memory leaks
+
+### 9.2 DriverUnload Routine
+
+The `DriverUnload` routine must be registered in `DriverEntry`:
+
+```cpp
+extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+{
+    UNREFERENCED_PARAMETER(RegistryPath);
+
+    // Register unload routine BEFORE cleaning traces
+    DriverObject->DriverUnload = DriverUnload;
+
+    // 1. Install dxgkrnl hook for communication
+    if (!Hook::Install(&Hook::Handler))
+        return STATUS_UNSUCCESSFUL;
+
+    // 2. Locate and setup mouse service callback
+    if (!SetupMouseCallback())
+        return STATUS_UNSUCCESSFUL;
+
+    // 3. Clean ALL traces and hide driver
+    // NOTE: We clean traces but keep DriverUnload pointer intact
+    CleanAllTraces(DriverObject);
+
+    return STATUS_SUCCESS;
+}
+```
+
+### 9.3 Unload Implementation
+
+```cpp
+extern "C" VOID DriverUnload(PDRIVER_OBJECT DriverObject)
+{
+    UNREFERENCED_PARAMETER(DriverObject);
+    
+    // 1. Restore PTE hook (CRITICAL - must be first)
+    if (g_HookState.active)
+    {
+        RestorePteHook();
+    }
+    
+    // 2. Free spoof stub memory
+    if (g_SpoofStub)
+    {
+        ExFreePoolWithTag(g_SpoofStub, 'fpSM');
+        g_SpoofStub = NULL;
+    }
+    
+    // 3. Clear global pointers
+    g_MouseServiceCallback = NULL;
+    g_MouseDeviceObject = NULL;
+    g_SpoofGadget = NULL;
+    
+    // 4. Small delay to ensure no pending operations
+    LARGE_INTEGER delay;
+    delay.QuadPart = -10000000; // 1 second
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+}
+```
+
+### 9.4 PTE Hook Restoration
+
+This is the **most critical** part of unloading:
+
+```cpp
+NTSTATUS RestorePteHook()
+{
+    if (!g_HookState.active || !g_HookState.pteAddress)
+        return STATUS_UNSUCCESSFUL;
+    
+    // 1. Save current PTE value
+    ULONG64 currentPte = *(ULONG64*)g_HookState.pteAddress;
+    
+    // 2. Build restored PTE with original PFN
+    ULONG64 restoredPte = currentPte;
+    
+    // Clear the PFN bits (bits 12-47)
+    restoredPte &= ~(0xFFFFFFFFFULL << 12);
+    
+    // Set original PFN
+    restoredPte |= (g_HookState.originalPfn << 12);
+    
+    // 3. Atomically swap the PTE back
+    InterlockedExchange64((LONG64*)g_HookState.pteAddress, restoredPte);
+    
+    // 4. Invalidate TLB for the hooked address
+    __invlpg(g_HookState.targetVA);
+    
+    // 5. Free the allocated page
+    if (g_HookState.newPageVA)
+    {
+        MmFreeContiguousMemory(g_HookState.newPageVA);
+        g_HookState.newPageVA = NULL;
+    }
+    
+    // 6. Mark hook as inactive
+    g_HookState.active = FALSE;
+    
+    return STATUS_SUCCESS;
+}
+```
+
+### 9.5 Usermode Trigger
+
+Add `CMD_UNLOAD` to the command dispatcher:
+
+```cpp
+NTSTATUS Hook::Handler(PREQUEST_DATA request)
+{
+    // Validate magic
+    if (!request || request->magic != REQUEST_MAGIC)
+        return STATUS_SUCCESS;
+    
+    __try {
+        switch (request->command)
+        {
+            case CMD_MOUSE_MOVE:
+                request->result = InjectMouseMove(
+                    request->mouseData.x,
+                    request->mouseData.y
+                );
+                break;
+            
+            case CMD_MOUSE_BUTTON:
+                request->result = InjectMouseButton(
+                    request->mouseData.buttonFlags,
+                    request->mouseData.buttonData
+                );
+                break;
+            
+            case CMD_UNLOAD:
+                // Mark for unload - actual unload happens after we return
+                request->result = STATUS_SUCCESS;
+                
+                // Schedule unload in system worker thread
+                // This prevents deadlock from unloading while in hook context
+                WORK_QUEUE_ITEM* workItem = (WORK_QUEUE_ITEM*)ExAllocatePoolWithTag(
+                    NonPagedPool, sizeof(WORK_QUEUE_ITEM), 'ulnM'
+                );
+                if (workItem)
+                {
+                    ExInitializeWorkItem(workItem, UnloadWorker, workItem);
+                    ExQueueWorkItem(workItem, DelayedWorkQueue);
+                }
+                break;
+            
+            case CMD_PING:
+                request->result = g_HookState.active ? 0x4D4F5553 : 0x4D535046;
+                break;
+            
+            case CMD_VERIFY_PTE:
+                if (request->buffer && request->size >= sizeof(PTE_HOOK_STATE))
+                {
+                    RtlCopyMemory((PVOID)request->buffer, &g_HookState, sizeof(PTE_HOOK_STATE));
+                    request->result = STATUS_SUCCESS;
+                }
+                break;
+            
+            case CMD_VERIFY_MOUSE:
+                request->result = (ULONG64)g_MouseServiceCallback;
+                break;
+            
+            default:
+                request->result = STATUS_INVALID_PARAMETER;
+                break;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        request->result = STATUS_ACCESS_VIOLATION;
+    }
+    
+    return STATUS_SUCCESS;
+}
+```
+
+### 9.6 Unload Worker Routine
+
+This prevents deadlock by unloading outside the hook context:
+
+```cpp
+VOID UnloadWorker(PVOID Context)
+{
+    WORK_QUEUE_ITEM* workItem = (WORK_QUEUE_ITEM*)Context;
+    
+    // Get the driver object (stored globally during DriverEntry)
+    if (g_DriverObject && g_DriverObject->DriverUnload)
+    {
+        // Call the unload routine
+        g_DriverObject->DriverUnload(g_DriverObject);
+    }
+    
+    // Free the work item
+    ExFreePoolWithTag(workItem, 'ulnM');
+    
+    // Note: After DriverUnload completes, Windows will unload the driver
+}
+```
+
+### 9.7 Critical Considerations
+
+#### **Timing Issues**
+- Never unload while mouse injection is in progress
+- Add delay in DriverUnload to ensure pending operations complete
+- Use work queue to defer unload outside hook context
+
+#### **PTE Restoration Order**
+1. Restore PTE **first** (before freeing memory)
+2. Invalidate TLB
+3. Free allocated page
+4. Clear global state
+
+#### **Memory Leaks**
+Ensure all allocations are freed:
+- `g_SpoofStub` - ExFreePoolWithTag
+- `g_HookState.newPageVA` - MmFreeContiguousMemory
+- Work items - ExFreePoolWithTag after use
+
+#### **Race Conditions**
+- Use `InterlockedExchange64` for PTE swap
+- Check `g_HookState.active` before restoration
+- Ensure hook is restored before freeing memory
+
+### 9.8 Unload Verification
+
+```cpp
+// Usermode test
+REQUEST_DATA request = {0};
+request.magic = REQUEST_MAGIC;
+request.command = CMD_UNLOAD;
+
+NtQueryCompositionSurfaceStatistics(&request);
+
+if (request.result == STATUS_SUCCESS)
+{
+    printf("Driver unload initiated\n");
+    
+    // Wait for unload
+    Sleep(2000);
+    
+    // Verify driver is gone
+    request.command = CMD_PING;
+    NTSTATUS status = NtQueryCompositionSurfaceStatistics(&request);
+    
+    // Should fail or return original function behavior
+    if (status != STATUS_SUCCESS || request.result != 0x4D4F5553)
+        printf("Driver successfully unloaded\n");
+}
+```
+
+---
+
+## 10. Kernel Imports (`definitions.h`)
+
+### Undocumented APIs Used
+
+```cpp
+extern "C" {
+    // Mouse service callback type
+    typedef VOID (*MOUSE_SERVICE_CALLBACK)(
+        PDEVICE_OBJECT DeviceObject,
+        PMOUSE_INPUT_DATA InputDataStart,
+        PMOUSE_INPUT_DATA InputDataEnd,
+        PULONG InputDataConsumed
+    );
+    
+    // System module enumeration
+    NTSTATUS ZwQuerySystemInformation(
+        ULONG InfoClass,
+        PVOID Buffer,
+        ULONG Length,
+        PULONG ReturnLength
+    );
+    
+    // Export resolution
+    PVOID RtlFindExportedRoutineByName(
+        PVOID ImageBase,
+        PCCH RoutineName
+    );
+    
+    // Image headers
+    PIMAGE_NT_HEADERS RtlImageNtHeader(PVOID Base);
+    
+    // AVL tree ops
+    PVOID RtlLookupElementGenericTableAvl(
+        PRTL_AVL_TABLE Table,
+        PVOID Buffer
+    );
+    
+    BOOLEAN RtlDeleteElementGenericTableAvl(
+        PRTL_AVL_TABLE Table,
+        PVOID Buffer
+    );
+    
+    // Resource locks
+    VOID ExAcquireResourceExclusiveLite(
+        PERESOURCE Resource,
+        BOOLEAN Wait
+    );
+    
+    VOID ExReleaseResourceLite(
+        PERESOURCE Resource
+    );
+}
+```
+
+### Custom Kernel Structures
+
+```cpp
+// PiDDB structures for cleaning
+typedef struct PiDDBCacheEntry {
+    LIST_ENTRY      List;
+    UNICODE_STRING  DriverName;
+    ULONG           TimeDateStamp;
+    NTSTATUS        LoadStatus;
+    char            _pad[16];
+} PIDCacheobj;
+
+// MM_UNLOADED_DRIVER structure
+typedef struct _MM_UNLOADED_DRIVER {
+    UNICODE_STRING Name;
+    PVOID ModuleStart;
+    PVOID ModuleEnd;
+    ULONG64 UnloadTime;
+} MM_UNLOADED_DRIVER, *PMM_UNLOADED_DRIVER;
+
+// System module information
+typedef struct _RTL_PROCESS_MODULE_INFORMATION {
+    ULONG Section;
+    PVOID MappedBase;
+    PVOID ImageBase;
+    ULONG ImageSize;
+    ULONG Flags;
+    USHORT LoadOrderIndex;
+    USHORT InitOrderIndex;
+    USHORT LoadCount;
+    USHORT OffsetToFileName;
+    CHAR FullPathName[256];
+} RTL_PROCESS_MODULE_INFORMATION;
+
+typedef struct _RTL_PROCESS_MODULES {
+    ULONG NumberOfModules;
+    RTL_PROCESS_MODULE_INFORMATION Modules[1];
+} RTL_PROCESS_MODULES;
+```
+
+---
+
+## 10. Key Anti-Detection Summary
+
+| Threat | Mitigation |
+|--------|------------|
+| **Code integrity checks** | PTE hook — original physical page untouched |
+| **Stack walk detection** | Return address spoofing via ntoskrnl gadget |
+| **Mouse input monitoring** | Direct MouseClassServiceCallback injection (no SendInput/mouse_event) |
+| **Driver enumeration** | DriverObject NULLed, PsLoadedModuleList unlinked |
+| **PiDDB cache** | Cleaned on init (iqvw64e.sys entry removed) |
+| **MmUnloadedDrivers** | Cleaned on init |
+| **PE header analysis** | Headers zeroed with RtlZeroMemory |
+| **User→kernel communication** | Hooked existing dxgkrnl function (no custom device/IOCTL) |
+| **Large page integrity** | Proper PDE splitting before PTE modification |
+
+---
+
+## 11. Build Notes
+
+- **WDK required**: Windows Driver Kit (latest)
+- **Pool tag convention**: `'mEsM'` (mouse), `'etPM'` (PTE), `'fpSM'` (spoof), `'cLnM'` (clean), `'ulnM'` (unload)
+- **DriverUnload**: Fully unloadable via `CMD_UNLOAD` command. PTE hook is restored and all resources are freed.
+- **No IOCTL**: No `IoCreateDevice`, no `IRP_MJ_DEVICE_CONTROL`. All communication via hooked function.
+- **iqvw64e.sys timestamp**: `0x5284EAC3` — hardcoded for PiDDB lookup.
+- **Spoof stub memory**: Allocated from `NonPagedPoolExecute` — needed for shellcode execution.
+- **Mouse callback validation**: Always validate callback pointer before dereferencing to prevent BSOD.
+
+---
+
+## 12. Implementation Checklist
+
+- [ ] **Pattern Scanning**: Implement `MiGetPteAddress`, `PiDDB`, `MmUnloadedDrivers`, spoof gadget patterns
+- [ ] **PTE Hook**: Install PTE remapping with large page support
+- [ ] **Mouse Callback**: Locate `MouseClassServiceCallback` via device stack or pattern scan
+- [ ] **Spoof Call**: Initialize gadget + shellcode stub
+- [ ] **Trace Cleaning**: PiDDB, MmUnloadedDrivers, DriverObject hiding
+- [ ] **Command Dispatcher**: Handle `CMD_MOUSE_MOVE`, `CMD_MOUSE_BUTTON`, `CMD_UNLOAD`, `CMD_PING`
+- [ ] **Debug Commands**: `CMD_VERIFY_PTE`, `CMD_VERIFY_MOUSE` for troubleshooting
+- [ ] **Driver Unload**: Implement `DriverUnload` routine and `RestorePteHook()`
+- [ ] **Unload Worker**: System work queue for safe unload outside hook context
+- [ ] **Error Handling**: Proper `__try/__except` blocks around all usermode memory access
+- [ ] **Client**: Usermode test app to call via `win32u.dll!NtQueryCompositionSurfaceStatistics`
+
+---
+
+## 13. Debugging and Verification
+
+### Testing PTE Hook
+
+```cpp
+// CMD_VERIFY_PTE handler returns:
+typedef struct _DEBUG_PTE_INFO {
+    PVOID hookAddress;         // Virtual address of hooked function
+    ULONG64 originalPfn;       // Original physical frame
+    ULONG64 newPfn;            // Hooked physical frame
+    BYTE originalBytes[12];    // Original function bytes
+    BOOLEAN active;            // Hook status
+} DEBUG_PTE_INFO;
+```
+
+### Testing Mouse Callback
+
+```cpp
+// CMD_VERIFY_MOUSE returns:
+// - Address of g_MouseServiceCallback (should be in MouClass.sys range)
+// - Can validate against ZwQuerySystemInformation module list
+
+// Test injection:
+// 1. Send CMD_MOUSE_MOVE with small delta (x=1, y=1)
+// 2. Verify cursor moves on screen
+// 3. Check return status for errors
+```
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| **BSOD on hook** | Large page not split | Implement proper PDE splitting |
+| **Hook doesn't trigger** | Wrong function offset | Verify export via WinDbg |
+| **Mouse doesn't move** | Invalid callback pointer | Validate against MouClass.sys range |
+| **Stack detection** | Spoof not working | Verify gadget address in ntoskrnl |
+| **Driver still visible** | Incomplete cleaning | Check all PiDDB/MmUnloadedDrivers patterns |
+
+---
+
+## 14. Usermode Client Example
+
+```cpp
+#include <Windows.h>
+#include "shared.h"  // Same header as kernel
+
+typedef NTSTATUS (NTAPI* pNtQueryCompositionSurfaceStatistics)(PVOID);
+
+int main()
+{
+    // Load win32u.dll
+    HMODULE win32u = LoadLibraryA("win32u.dll");
+    if (!win32u) return -1;
+    
+    // Get function pointer
+    auto NtQueryCompositionSurfaceStatistics = 
+        (pNtQueryCompositionSurfaceStatistics)GetProcAddress(
+            win32u, "NtQueryCompositionSurfaceStatistics"
+        );
+    
+    if (!NtQueryCompositionSurfaceStatistics) return -2;
+    
+    // Test ping
+    REQUEST_DATA request = {0};
+    request.magic = REQUEST_MAGIC;
+    request.command = CMD_PING;
+    
+    NtQueryCompositionSurfaceStatistics(&request);
+    
+    if (request.result == 0x4D4F5553)
+        printf("Driver connected (PTE hook active)\n");
+    
+    // Inject mouse movement (10 pixels right)
+    request.command = CMD_MOUSE_MOVE;
+    request.mouseData.x = 10;
+    request.mouseData.y = 0;
+    request.mouseData.buttonFlags = 0;
+    
+    NtQueryCompositionSurfaceStatistics(&request);
+    
+    printf("Mouse injection: 0x%llx\n", request.result);
+    
+    return 0;
+}
+```
