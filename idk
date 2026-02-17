@@ -1,0 +1,385 @@
+# Stealth Kernel Mouse Driver — Complete Build Prompt
+
+> **Purpose**: This prompt contains everything needed to recreate the stealth kernel-mode mouse driver from scratch. **Your task is to write the COMPLETE, COMPILABLE source code for every file listed in the File Structure section.** Do not summarize; write the full code. It covers mouse injection via ServiceCallback, return address spoofing, PTE hooking on dxgkrnl.sys, and comprehensive trace cleaning.
+
+---
+
+## 1. Project Overview
+
+**Type**: External kernel-mode driver for Mouse Injection + Physical Memory Read  
+**Loader**: kdmapper (Intel iqvw64e.sys vulnerable driver)  
+**Anti-cheat target**: EAC (Easy Anti-Cheat) / BE (BattlEye)  
+**OS**: Windows 10/11 x64 (22H2+)  
+**Constraints**: **NO WINDOWS API AT ALL** for mouse input (use ServiceCallback). Avoid standard APIs like `SendInput`.
+
+### Architecture Flow
+
+```
+kdmapper loads driver.sys → DriverEntry()
+  → Hook::Install() — PTE hook on dxgkrnl.sys
+  → SetupMouse() — Locate MouseClassServiceCallback
+  → CleanAllTraces() — PiDDB, MmUnloadedDrivers, DriverObject hiding
+  → Driver is now invisible, communicates via hooked dxgkrnl function
+
+Usermode client:
+  → LoadLibrary("win32u.dll")
+  → GetProcAddress("NtQueryCompositionSurfaceStatistics")
+  → Call with REQUEST_DATA struct (magic = 0x4D4F5553 "MOUS")
+  → Hooked function dispatches to our mouse handler
+```
+
+---
+
+## 2. File Structure
+
+> **Instruction**: You must implement the full source code for every file listed below.
+
+```
+driver/
+├── driver.cpp          — DriverEntry, calls Hook::Install, SetupMouse, then CleanAllTraces
+├── driver.h            — Includes definitions.h + mouse.h
+├── definitions.h       — Kernel imports, Mouse structures, undocumented APIs
+├── shared.h            — REQUEST_DATA struct + command IDs (shared with usermode)
+├── hook.h              — Hook::Install / Hook::Handler prototypes
+├── hook.cpp            — PTE hook installation + command dispatcher
+├── pte_hook.h          — PTE-based hook engine (MiGetPteAddress, page remapping)
+├── mouse.h             — Mouse callback structures and prototypes
+├── mouse.cpp           — MouseClassServiceCallback location & injection logic
+├── spoof_call.h        — Return address spoofing via ntoskrnl gadget
+└── cleaner.h           — PiDDB, MmUnloadedDrivers, DriverObject cleaning
+```
+
+---
+
+## 3. Communication Protocol (`shared.h`)
+
+This header is included by BOTH kernel and usermode. It defines the communication protocol.
+
+### Command IDs
+
+```cpp
+typedef enum _DRIVER_COMMAND {
+    CMD_NONE          = 0,
+    CMD_MOUSE_MOVE    = 1,    // Inject mouse movement
+    CMD_MOUSE_BUTTON  = 2,    // Inject mouse button press/release
+    CMD_UNLOAD        = 98,   // Trigger driver unload
+    CMD_PING          = 99,   // Connection check
+    CMD_VERIFY_PTE    = 100,  // Debug: return PTE hook state
+    CMD_VERIFY_MOUSE  = 101,  // Debug: return mouse callback state
+} DRIVER_COMMAND;
+```
+
+### Request Structure
+
+```cpp
+#define REQUEST_MAGIC 0x4D4F5553  // "MOUS"
+
+typedef struct _MOUSE_DATA {
+    LONG x;
+    LONG y;
+    USHORT buttonFlags;
+    USHORT buttonData;
+} MOUSE_DATA;
+
+typedef struct _REQUEST_DATA {
+    unsigned int    magic;           // Must be REQUEST_MAGIC
+    unsigned int    command;         // DRIVER_COMMAND enum
+    unsigned __int64 buffer;        // Usermode buffer for debug output
+    unsigned __int64 size;          // Buffer size
+    MOUSE_DATA      mouseData;      // For CMD_MOUSE_MOVE / CMD_MOUSE_BUTTON
+    unsigned __int64 result;        // Output: success/failure code
+} REQUEST_DATA, *PREQUEST_DATA;
+```
+
+**Key design**: The `magic` field distinguishes our calls from legitimate dxgkrnl calls. If `magic != REQUEST_MAGIC`, the handler returns `STATUS_SUCCESS` immediately (pass-through to original).
+
+---
+
+## 4. Mouse Injection Mechanism (`mouse.cpp`)
+
+To avoid `SendInput` and `mouse_event` (which are monitored by anti-cheat), we inject directly into the Mouse Class Service Callback.
+
+### Method 1: Device Stack Walk (Primary)
+```cpp
+// ... code as before ...
+```
+
+### Method 2: Pattern Scanning (Fallback / More Reliable)
+
+If stack walk fails, scan `MouClass.sys` for the callback registration.
+
+```cpp
+// Typical prologue: 48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC ??
+BYTE mouseCallbackPattern[] = { 0x48, 0x89, 0x5C, 0x24, 0x00, 0x48, 0x89 };
+const char mouseMask[] = "xxxx?xx";
+
+PVOID FindPatternInModule(PVOID base, SIZE_T size, BYTE* pattern, const char* mask) {
+    // Standard pattern scan implementation
+    // ...
+}
+
+NTSTATUS FindCallbackViaScan() {
+    // 1. Get MouClass.sys base address via ZwQuerySystemInformation
+    // 2. Scan for pattern
+    // 3. Verify legitimate function start
+    // 4. Set g_MouseServiceCallback
+}
+```
+
+### Injection Logic
+
+```cpp
+NTSTATUS SetupMouseCallback()
+{
+    UNICODE_STRING deviceName;
+    RtlInitUnicodeString(&deviceName, L"\\Device\\PointerClass0");
+    
+    PFILE_OBJECT fileObject = NULL;
+    PDEVICE_OBJECT deviceObject = NULL;
+    
+    // Get the device object
+    NTSTATUS status = IoGetDeviceObjectPointer(&deviceName, FILE_READ_DATA, &fileObject, &deviceObject);
+    if (!NT_SUCCESS(status)) return status;
+    
+    // Walk up the device stack to find the port driver
+    PDEVICE_OBJECT lowerDevice = IoGetAttachedDeviceReference(deviceObject);
+    ObfDereferenceObject(fileObject);
+    
+    // Scan device extension for callback pointer (offset 0x10-0x100)
+    for (ULONG offset = 0x10; offset < 0x100; offset += 0x8)
+    {
+        PVOID* potentialCallback = (PVOID*)((ULONG_PTR)lowerDevice->DeviceExtension + offset);
+        if (MmIsAddressValid(potentialCallback) && MmIsAddressValid(*potentialCallback))
+        {
+            PVOID callbackPtr = *potentialCallback; // Verify points to MouClass driver module
+            g_MouseServiceCallback = (MOUSE_SERVICE_CALLBACK)callbackPtr;
+            g_MouseDeviceObject = lowerDevice;
+            return STATUS_SUCCESS;
+        }
+    }
+    return STATUS_NOT_FOUND;
+}
+```
+
+### Injection Logic
+
+```cpp
+NTSTATUS InjectMouseMove(LONG x, LONG y)
+{
+    if (!g_MouseServiceCallback || !g_MouseDeviceObject) return STATUS_UNSUCCESSFUL;
+    
+    MOUSE_INPUT_DATA data = {0};
+    data.UnitId = 0;
+    data.Flags = MOUSE_MOVE_RELATIVE;
+    data.LastX = x;
+    data.LastY = y;
+    
+    ULONG consumed = 0;
+    // SPOOFED CALL IS CRITICAL
+    SpoofCall4(g_MouseServiceCallback, g_MouseDeviceObject, &data, &data + 1, &consumed);
+    
+    return consumed > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+```
+
+---
+
+## 5. Stealth Communication: PTE Hook (`pte_hook.h`)
+
+We route communication through `dxgkrnl.sys` by modifying Page Table Entries (PTEs).
+
+**Target**: `NtQueryCompositionSurfaceStatistics` in `dxgkrnl.sys`.
+
+### Hook Installation
+
+1. **Find `MiGetPteAddress`** in ntoskrnl via pattern: `48 C1 E9 09 48 B8 ...`
+2. **Check PDE for large page**: If 2MB huge page, split into 512x 4KB pages to avoid TLB corruption.
+3. **Allocate new physical page**: `MmAllocateContiguousMemorySpecifyCache(PAGE_EXECUTE_READWRITE)`.
+4. **Copy original page**: `MmMapIoSpace` original PFN → `RtlCopyMemory` to new page.
+5. **Apply trampoline**: Write `mov rax, <Handler>; jmp rax` at the function offset in the *new* page.
+6. **Swap PTE**: `InterlockedExchange64(pte, newPfn | flags)` then `__invlpg`.
+
+```cpp
+typedef struct _PTE_HOOK_STATE {
+    PVOID       targetVA;       // Hooked virtual address
+    PPTE_ENTRY  pteAddress;     // Pointer to the PTE
+    ULONG64     originalPfn;    // Original physical frame number
+    ULONG64     newPfn;         // Our page's physical frame number
+    PVOID       newPageVA;      // Virtual address of our allocated page
+    BOOLEAN     active;         // Is hook active?
+} PTE_HOOK_STATE;
+```
+
+### Command Dispatcher (`Hook::Handler`)
+
+```cpp
+NTSTATUS Hook::Handler(PREQUEST_DATA request)
+{
+    if (!request || request->magic != REQUEST_MAGIC)
+        return STATUS_SUCCESS; // Pass-through
+    
+    switch (request->command) {
+        case CMD_MOUSE_MOVE:
+            InjectMouseMove(request->mouseData.x, request->mouseData.y);
+            break;
+        case CMD_UNLOAD:
+            // Queue worker thread to unload safely (don't unload from hook context!)
+            break;
+        case CMD_PING:
+            request->result = 0x4D4F5553;
+            break;
+    }
+    return STATUS_SUCCESS;
+}
+```
+
+---
+
+## 6. Return Address Spoofing (`spoof_call.h`)
+
+Route calls through a gadget in `ntoskrnl.exe` so the callee sees a return address inside a legitimate module.
+
+**Gadget**: `48 83 C4 28 C3` (`add rsp, 0x28; ret`)
+
+### Shellcode Stub
+
+```asm
+41 5B                 pop r11              ; save real return address
+48 8B C1              mov rax, rcx         ; target fn
+48 8B CA              mov rcx, rdx         ; a1
+49 8B D0              mov rdx, r8          ; a2
+4D 8B C1              mov r8, r9           ; a3
+4C 8B 4C 24 20        mov r9, [rsp+0x20]   ; a4
+48 83 EC 38           sub rsp, 0x38        ; buffer
+49 BA [GADGET]        mov r10, <gadget>
+4C 89 14 24           mov [rsp], r10       ; fake return
+4C 89 5C 24 30        mov [rsp+0x30], r11  ; restore real return
+FF E0                 jmp rax
+```
+
+---
+
+## 7. Trace Cleaning (`cleaner.h`)
+
+**1. PiDDB Cache Cleaning**
+
+```cpp
+NTSTATUS CleanPiDDBCacheTable() {
+    // 1. Locate PiDDBLock and PiDDBCacheTable via pattern scan
+    //    Lock: 48 8D 0D ...
+    //    Table: 48 8D 0D ...
+    
+    PVOID Lock = ResolvRelativeAddress(FindPattern(...), 3, 7);
+    PVOID Table = ResolvRelativeAddress(FindPattern(...), 3, 7);
+    
+    PIDCacheobj lookup = {0};
+    RtlInitUnicodeString(&lookup.DriverName, L"iqvw64e.sys");
+    lookup.TimeDateStamp = 0x5284EAC3;
+    
+    ExAcquireResourceExclusiveLite((PERESOURCE)Lock, TRUE);
+    
+    // Lookup and remove
+    PIDCacheobj* entry = (PIDCacheobj*)RtlLookupElementGenericTableAvl(
+        (PRTL_AVL_TABLE)Table, &lookup
+    );
+    
+    if (entry) {
+        RemoveEntryList(&entry->List);
+        RtlDeleteElementGenericTableAvl((PRTL_AVL_TABLE)Table, entry);
+    }
+    
+    ExReleaseResourceLite((PERESOURCE)Lock);
+    return STATUS_SUCCESS;
+}
+```
+
+**2. MmUnloadedDrivers Cleaning**
+
+```cpp
+NTSTATUS CleanMmUnloadedDrivers() {
+    // Pattern: 4C 8B ?? ?? ?? ?? ?? 4C 8B C9 4D 85 ?? 74
+    PVOID MmUnloadedDrivers = ResolveRelative...;
+    PULONG MmLastUnloadedDriver = ResolveRelative...;
+    
+    PMM_UNLOADED_DRIVER entries = *(PMM_UNLOADED_DRIVER*)MmUnloadedDrivers;
+    ULONG count = *(ULONG*)MmLastUnloadedDriver;
+    
+    for (ULONG i = 0; i < count; i++) {
+        if (wcsstr(entries[i].Name.Buffer, L"iqvw64e.sys")) {
+            RtlZeroMemory(&entries[i], sizeof(MM_UNLOADED_DRIVER));
+            // Shift remaining entries down or just zero this one
+        }
+    }
+    return STATUS_SUCCESS;
+}
+```
+
+**3. Driver Object Hiding**
+
+```cpp
+NTSTATUS HideDriverObject(PDRIVER_OBJECT DriverObject) {
+    // 1. Clear Name
+    RtlZeroMemory(DriverObject->DriverName.Buffer, DriverObject->DriverName.Length);
+    DriverObject->DriverName.Length = 0;
+    
+    // 2. Unlink from PsLoadedModuleList
+    PLDR_DATA_TABLE_ENTRY entry = (PLDR_DATA_TABLE_ENTRY)DriverObject->DriverSection;
+    RemoveEntryList(&entry->InLoadOrderLinks);
+    
+    // 3. Erase PE Headers
+    RtlZeroMemory(DriverObject->DriverStart, 0x1000); // Wipe page 0
+    
+    // 4. NULL Handlers
+    DriverObject->DriverSection = NULL;
+    DriverObject->DriverStart = NULL;
+    DriverObject->DriverSize = 0;
+    DriverObject->DriverUnload = NULL; // We manage unload manually via work item
+    
+    return STATUS_SUCCESS;
+}
+```
+
+---
+
+## 8. Driver Unload
+
+Unlike basic drivers, this one MUST support unloading for testing.
+1. **Restore PTE**: Swap original PFN back into PTE. `__invlpg`.
+2. **Free Memory**: Free `g_SpoofStub` and `newPageVA`.
+3. **Delay**: `KeDelayExecutionThread` before final return.
+
+---
+
+## 9. Kernel Imports (`definitions.h`)
+
+**Structs**:
+```cpp
+typedef struct PiDDBCacheEntry {
+    LIST_ENTRY List; UNICODE_STRING DriverName; ULONG TimeDateStamp; NTSTATUS LoadStatus;
+    char _pad[16];
+} PIDCacheobj;
+
+typedef struct _MM_UNLOADED_DRIVER {
+    UNICODE_STRING Name; PVOID ModuleStart; PVOID ModuleEnd; ULONG64 UnloadTime;
+} MM_UNLOADED_DRIVER;
+
+typedef struct _MOUSE_INPUT_DATA {
+    USHORT UnitId; USHORT Flags;
+    union { ULONG Buttons; struct { USHORT ButtonFlags; USHORT ButtonData; }; };
+    ULONG RawButtons; LONG LastX; LONG LastY; ULONG ExtraInformation;
+} MOUSE_INPUT_DATA, *PMOUSE_INPUT_DATA;
+```
+
+**Undocumented APIs**:
+- `ZwQuerySystemInformation`
+- `RtlFindExportedRoutineByName`
+- `RtlLookupElementGenericTableAvl`
+- `ExAcquireResourceExclusiveLite`
+
+---
+
+## 10. Build Notes
+- **WDK Version**: Latest Windows 10/11 WDK.
+- **C++ Version**: C++17.
+- **Pool Tags**: Use 'mEsM' (mouse), 'fpSM' (spoof).
+- **Architecture**: x64 only.
